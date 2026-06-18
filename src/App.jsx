@@ -1,11 +1,26 @@
 import { useState, useEffect } from "react";
+import { createClient } from "@supabase/supabase-js";
 import { PieChart, Pie, Cell, BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from "recharts";
 import { Plus, Trash2, TrendingUp, Wallet, Target, PiggyBank, BarChart3, ChevronDown, ChevronRight, Lock, Eye, EyeOff, CreditCard, CheckCircle, Clock } from "lucide-react";
+
+const SUPABASE_URL = "https://dnushvahwynsrfopwdvs.supabase.co";
+const SUPABASE_KEY = "sb_publishable_TMhAtMIkhoOYODcjhYw4Xg_yZgEEa8K";
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const APP_PASSWORD = "0495";
 const fmt = (n) => "R$ " + (n || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const mKey = (d) => d.slice(0, 7);
 const COLORS = ["#a78bfa","#818cf8","#38bdf8","#34d399","#fbbf24","#f472b6","#fb923c","#94a3b8","#4ade80","#e879f9"];
+
+const num = (v) => v == null ? 0 : Number(v);
+const isUuid = (v) => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+
+// Row mappers: Supabase (snake_case) -> app (camelCase), with numeric coercion
+const txFrom = r => ({ id: r.id, type: r.type, amount: num(r.amount), category: r.category, date: r.date });
+const goalFrom = r => ({ id: r.id, name: r.name, target: num(r.target), saved: num(r.saved) });
+const investFrom = r => ({ id: r.id, amount: num(r.amount), type: r.type, date: r.date });
+const cardFrom = r => ({ id: r.id, name: r.name, bank: r.bank, limit: num(r.limit), closeDay: num(r.close_day), dueDay: num(r.due_day) });
+const purchaseFrom = r => ({ id: r.id, name: r.name, category: r.category, total: num(r.total), installments: num(r.installments), installmentValue: num(r.installment_value), date: r.date, cardId: r.card_id });
 
 function monthsBetween(a, b) {
   const [ay, am] = a.split("-").map(Number);
@@ -143,16 +158,58 @@ export default function App() {
 
   useEffect(() => {
     const load = async () => {
-      const map = { tx: setTx, goals: setGoals, invest: setInvest, budget: setBudget, emergency: setEmergency, cards: setCards, purchases: setPurchases };
-      for (const k of Object.keys(map)) {
-        try { const r = await window.storage.get("fin:" + k); if (r && r.value) map[k](JSON.parse(r.value)); } catch(e) {}
-      }
+      try {
+        const [t, g, iv, b, e, c, p] = await Promise.all([
+          supabase.from("transactions").select("*").order("created_at", { ascending: true }),
+          supabase.from("goals").select("*").order("created_at", { ascending: true }),
+          supabase.from("investments").select("*").order("created_at", { ascending: true }),
+          supabase.from("budget").select("*").eq("id", 1).maybeSingle(),
+          supabase.from("emergency").select("*").eq("id", 1).maybeSingle(),
+          supabase.from("cards").select("*").order("created_at", { ascending: true }),
+          supabase.from("purchases").select("*").order("created_at", { ascending: true }),
+        ]);
+        if (t.data) setTx(t.data.map(txFrom));
+        if (g.data) setGoals(g.data.map(goalFrom));
+        if (iv.data) setInvest(iv.data.map(investFrom));
+        if (b.data) setBudget({ essenciais: num(b.data.essenciais), estilo: num(b.data.estilo), investir: num(b.data.investir) });
+        if (e.data) setEmergency({ months: num(e.data.months), saved: num(e.data.saved) });
+        if (c.data) setCards(c.data.map(cardFrom));
+        if (p.data) setPurchases(p.data.map(purchaseFrom));
+      } catch (err) { console.error("load error", err); }
       setLoaded(true);
     };
     load();
   }, []);
 
-  const save = async (k, v) => { try { await window.storage.set("fin:" + k, JSON.stringify(v)); } catch(e) {} };
+  // budget / emergency are single-row tables (id = 1), persisted via upsert
+  const save = async (k, v) => {
+    try {
+      if (k === "budget") await supabase.from("budget").upsert({ id: 1, essenciais: v.essenciais, estilo: v.estilo, investir: v.investir });
+      else if (k === "emergency") await supabase.from("emergency").upsert({ id: 1, months: v.months, saved: v.saved });
+    } catch (err) { console.error("save error", err); }
+  };
+
+  const addRow = (table, set, toDb, fromDb) => async (item) => {
+    const { data, error } = await supabase.from(table).insert(toDb(item)).select().single();
+    if (!error && data) set(prev => [...prev, fromDb(data)]);
+    else if (error) console.error("insert " + table, error);
+  };
+  const delRow = (table, set) => async (id) => {
+    const { error } = await supabase.from(table).delete().eq("id", id);
+    if (!error) set(prev => prev.filter(x => x.id !== id));
+    else console.error("delete " + table, error);
+  };
+
+  const addTx = addRow("transactions", setTx, i => ({ type: i.type, amount: i.amount, category: i.category, date: i.date }), txFrom);
+  const delTx = delRow("transactions", setTx);
+  const addGoal = addRow("goals", setGoals, i => ({ name: i.name, target: i.target, saved: i.saved }), goalFrom);
+  const delGoal = delRow("goals", setGoals);
+  const addInvest = addRow("investments", setInvest, i => ({ amount: i.amount, type: i.type, date: i.date }), investFrom);
+  const delInvest = delRow("investments", setInvest);
+  const addCard = addRow("cards", setCards, i => ({ name: i.name, bank: i.bank, limit: i.limit, close_day: i.closeDay, due_day: i.dueDay }), cardFrom);
+  const delCard = delRow("cards", setCards);
+  const addPurchase = addRow("purchases", setPurchases, i => ({ name: i.name, category: i.category, total: i.total, installments: i.installments, installment_value: i.installmentValue, date: i.date, card_id: isUuid(i.cardId) ? i.cardId : null }), purchaseFrom);
+  const delPurchase = delRow("purchases", setPurchases);
 
   const now = new Date().toISOString().slice(0, 10);
   const curMonth = mKey(now);
@@ -168,20 +225,6 @@ export default function App() {
   };
   const avgIncome = avgOf("in");
   const avgExpense = avgOf("out");
-
-  const mkAdd = (arr, set, key) => item => { const n = [...arr, { ...item, id: Date.now() }]; set(n); save(key, n); };
-  const mkDel = (arr, set, key) => id => { const n = arr.filter(x => x.id !== id); set(n); save(key, n); };
-
-  const addTx = mkAdd(tx, setTx, "tx");
-  const delTx = mkDel(tx, setTx, "tx");
-  const addGoal = mkAdd(goals, setGoals, "goals");
-  const delGoal = mkDel(goals, setGoals, "goals");
-  const addInvest = mkAdd(invest, setInvest, "invest");
-  const delInvest = mkDel(invest, setInvest, "invest");
-  const addCard = mkAdd(cards, setCards, "cards");
-  const delCard = mkDel(cards, setCards, "cards");
-  const addPurchase = mkAdd(purchases, setPurchases, "purchases");
-  const delPurchase = mkDel(purchases, setPurchases, "purchases");
 
   const totalInvested = invest.reduce((s, i) => s + i.amount, 0);
   const byCat = ALL_CATS.map((c, i) => ({ name: c, color: COLORS[i % COLORS.length], value: monthTx.filter(t => t.type === "out" && t.category === c).reduce((s, t) => s + t.amount, 0) })).filter(d => d.value > 0);
@@ -820,7 +863,7 @@ function Investimentos({ invest, addInvest, delInvest, totalInvested, investData
   );
 }
 
-// ── Metas ─────────────────────────────────────────────────────────────
+// -- Metas --------------------------------------------------------------
 function Metas({ goals, addGoal, delGoal }) {
   const [name, setName] = useState("");
   const [target, setTarget] = useState("");
